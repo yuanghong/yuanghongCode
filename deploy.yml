@@ -1,0 +1,153 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oam-admin-service
+  namespace: platform
+  labels:
+    backup: saas
+    name: oam-admin-service
+    version: 3.1.4
+    app.kubernetes.io/name: oam-admin-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      name: oam-admin-service
+      app.kubernetes.io/name: oam-admin-service
+  template:
+    metadata:
+      labels:
+        name: oam-admin-service
+        app.kubernetes.io/name: oam-admin-service
+        version: 1.0.2
+      annotations:
+        vault.security.banzaicloud.io/vault-addr: http://vault.default.svc.cluster.local:8200
+        vault.security.banzaicloud.io/vault-path: kubernetes
+        vault.security.banzaicloud.io/vault-role: default
+        vault.security.banzaicloud.io/vault-skip-verify: "true"
+    spec:
+      serviceAccountName: msip-user
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: oam
+                operator: In
+                values:
+                - "true"
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: name
+                operator: In
+                values:
+                - oam-admin-service
+            topologyKey: "kubernetes.io/hostname"
+      initContainers:
+        - name: wait-db
+          image: imagerepo.td-tech.com:5001/busybox:1.28
+          command: [ 'sh', '-c', 'until nc -z cnp-leader.platform 3306 ; do echo waiting for db; sleep 2; done;' ]
+        - name: migration-db
+          image: imagerepo.td-tech.com:5001/flyway:10.10.0.1
+          command: [ 'flyway','migrate' ]
+          env:
+            - name: FLYWAY_URL
+              value: jdbc:mysql://cnp-leader:3306/
+            - name: FLYWAY_USER
+              value: cnp
+            - name: FLYWAY_PASSWORD
+              value: vault:secret/data/gauss#GAUSS_PASSWORD
+            - name: environment
+              value: mysql
+            - name: FLYWAY_LOCATIONS
+              value: filesystem:/flyway/db/migration/plt_config
+            - name: FLYWAY_SQL_MIGRATION_SUFFIXES
+              value: ".sql"
+            - name: FLYWAY_DEFAULT_SCHEMA
+              value: plt_config
+            - name: FLYWAY_INIT_SQL
+              value: "CREATE DATABASE IF NOT EXISTS plt_config DEFAULT charset UTF8MB4"
+          volumeMounts:
+            - mountPath: /flyway/db/migration/plt_config/
+              name: oam-dbscript
+      containers:
+        - name: oam-admin-service
+          image: imagerepo.td-tech.com:5001/oam-admin-service:3.1.4
+          imagePullPolicy: IfNotPresent
+          command:
+            - /start.sh
+          env:
+            - name: DB_PASSWORD
+              value: vault:secret/data/gauss#GAUSS_PASSWORD
+            - name: REDIS_PASSWORD
+              value: vault:secret/data/redis#REDIS_PASSWORD
+            - name: LOG_MODE
+              value: common
+            - name: NGINX_READ_TIMEOUT
+              value: '360000'
+            - name: NGINX_CONNECT_TIMEOUT
+              value: '60000'
+            - name: THREE_DOWNLOAD_EXECUTOR_AWAITTERMINATION_TIMEOUT
+              value: '360000'
+            - name: LOG_CACHE_DIR
+              value: /opt/app/log_cache
+            - name: ELASTICSEARCH_URL
+              value: http://elasticsearch-master:9200/
+          volumeMounts:
+            - mountPath: /home/ubp/logs/fluentd-log/
+              subPath: fluentd-log
+              name: log
+            - mountPath: /var/log/
+              subPath: syslog
+              name: log
+            - mountPath: /opt/app/ssh
+              name: ssh-path
+            - mountPath: /opt/version/
+              name: version-path
+            - name: localtime
+              mountPath: /etc/localtime
+          ports:
+            - name: http
+              containerPort: 8091
+              protocol: TCP
+          livenessProbe:
+            failureThreshold: 3
+            initialDelaySeconds: 120
+            periodSeconds: 5
+            timeoutSeconds: 5
+            exec:
+              command:
+              - /bin/sh
+              - -c
+              - ls /opt/version/  && curl -X GET http://localhost:8091/OamAdminService/health 
+          readinessProbe:
+            httpGet:
+              path: /OamAdminService/health
+              port: http
+            initialDelaySeconds: 60
+            periodSeconds: 20
+          resources:
+            limits:
+              cpu: 3
+              memory: 2Gi
+            requests:
+              cpu: 20m
+              memory: 50Mi
+      volumes:
+        - name: oam-dbscript
+          configMap:
+            name: oam-dbscript
+        - hostPath:
+            path: /data/logs/
+          name: log
+        - hostPath:
+            path: /opt/tmp
+          name: ssh-path
+        - name: version-path
+          persistentVolumeClaim:
+            claimName: version-pvc
+        - name: localtime
+          hostPath:
+            path: /etc/localtime
